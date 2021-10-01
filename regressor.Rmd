@@ -1,0 +1,359 @@
+---
+title: COMP2550/COMP4450/COMP6445 - Data Science and Applied Machine Learning Assignment
+---
+
+```{r, warning=FALSE,message=FALSE,error=FALSE}
+# load in packages
+library(caret)
+library(dplyr)
+```
+
+
+```{r}
+# load the dataset
+data_df <- read.csv("sample_users_100k.csv.bz2", sep="\t", stringsAsFactors = F)
+```
+
+
+Next, we coerce the `botscore` variable to be numeric and we correct abnormal values:
+```{r warning=FALSE,error=FALSE}
+# make botscore numerical and correct invalid data
+data_df$botscore <- as.numeric(data_df$botscore)
+toDel <- which(data_df$botscore < 0)
+data_df <- data_df[-toDel,]
+toDel <- which(is.na(data_df$botscore))
+data_df <- data_df[-toDel,]
+```
+Finally, we construct the $\psi$ measure, defined as the ratio of friends (`friendsCount`) to followers (`followersCount`):
+```{r}
+# construct the $\psi$ measure from the previous tutorial
+data_df$psi <- data_df$friendsCount / (data_df$followersCount + 0.01)
+```
+
+
+Visibly, out of the `r ncol(data_df)` features in `data_df`, many are of the type character (`chr`).
+Some are already numerical (`num` and `int`) while other are logical and need to be transformed in a meaningful way.
+We perform the following operations:
+
+* we keep all numerical features and we drop entries with `NA` values;
+* we convert `verified` to numerical (True to 1 and False to 0; `NA` to 0);
+* for `location.objectType`, we convert "place" to 1, `NA` to 0;
+* for `mcsize` (i.e. mean cascade size, the mean size of cascades started by a given user, [see full meaning in the paper here](https://arxiv.org/pdf/1802.09808.pdf): https://arxiv.org/pdf/1802.09808.pdf):  convert `NA` to 0.
+
+
+
+Here we add our own features
+```{r}
+l <- as.numeric(as.Date(data_df$collectionDate) - as.Date(data_df$postedTime))
+data_df$days_since_posted <- l
+
+data_df$has_summary <- is.na(data_df$summary)
+data_df$has_summary <- data_df$has_summary * 1
+
+data_df$has_timezone <- is.na(data_df$twitterTimeZone)
+data_df$has_timezone <- data_df$has_timezone * 1
+
+
+
+data_df$words <- strsplit(sapply(gsub("[^[:alnum:][:space:]#]", "", data_df$summary), tolower), " ")
+
+countHashOccurrences <- function(s) {
+    s2 <- gsub("#","",s)
+    return (nchar(s) - nchar(s2))
+}
+data_df$no_hashtags <- countHashOccurrences(data_df$summary)
+data_df$no_hashtags[is.na(data_df$no_hashtags)] <- 0
+
+data_df$median_wordlength <- as.numeric(lapply(lapply(data_df$words, nchar), median))
+data_df$median_wordlength[is.na(data_df$median_wordlength)] <- 0
+
+data_df$longest_word <- as.numeric(lapply(lapply(data_df$words, nchar), (function (x) max(x, 0))))
+data_df$longest_word[is.na(data_df$longest_word)] <- 0
+```
+
+
+```{r}
+# Deal with missing value and category variables: 
+features = c(
+  'listedCount', # drop na
+  'favoritesCount', # drop na
+  'friendsCount', # drop na
+  'followersCount', # drop na
+  'verified', # convert True to 1 and False to 0; na to 0 
+  'location.objectType', # convert "place" to 1, na to 0 
+  'mcsize', # convert na to 0
+  'influence', # drop na
+  'influence_percentile', # drop na
+  'tweetsCount', # drop na
+  'retweetsCount', # drop na
+  'days_since_posted',
+  'has_summary',
+  'has_timezone',
+  'no_hashtags', # maybe
+  'median_wordlength', # maybe
+  'longest_word', # maybe
+  'psi', 
+  'botscore' # drop na
+)
+
+# keep only selected features
+data_df <- data_df[, features]
+
+# clean verified
+data_df$verified[is.na(data_df$verified)] <- F
+data_df$verified <- data_df$verified * 1
+
+# clean location.objectType
+data_df$location.objectType[data_df$location.objectType == "place"] <- 1
+data_df$location.objectType[is.na(data_df$location.objectType)] <- 0
+data_df$location.objectType <- as.numeric(data_df$location.objectType)
+
+# clean mcsize
+data_df$mcsize[is.na(data_df$mcsize)] <- 0
+
+# remove non-complete entries
+toKeep <- rowSums(is.na(data_df)) == 0
+data_df <- data_df[toKeep, ]
+```
+
+
+```{r}
+# first construct a train and a test sample, each of 1000 users
+#set.seed(287)
+#ample2k <- sample_n(tbl = data_df, size = 2000, replace = F)
+##sample2k <- sample_n(tbl = data_df, size = 82454, replace = F)
+
+#data_train <- sample2k[1:1000,]
+#data_test <- sample2k[1001:2000,]
+##data_train <- sample2k[1:60000,]
+##data_test <- sample2k[60000:82454,]
+
+data_train <- sample_n(tbl = data_df, size = 82454, replace = F)
+#data_train <- sample_n(tbl = data_df, size = 4000, replace = F)
+```
+
+
+```{r}
+metrics <- data.frame(matrix(data = NA, nrow = 3, ncol = 0))
+```
+
+
+```{r}
+#fitControl <- trainControl(
+#  # Repeated 10–fold CV 
+#  method = "repeatedcv",
+#  number = 10,
+#  # repeated 10 times
+#  repeats = 10,
+#  returnResamp = "all")
+
+#model_rf <- train(botscore ~ ., data = data_train, 
+#                  method = "ranger", trControl = fitControl)
+
+#mean(model_rf$resample$RMSE)
+```
+
+```{r}
+data_train_preproc <- preProcess(select(data_train, - botscore), 
+                                 method = c("center", "scale", "YeoJohnson"))#, "nzv", "pca"))
+                                # method = c("center", "scale", "YeoJohnson", "nzv", "pca"))
+
+train_df <- predict(data_train_preproc, data_train)
+#test_df <- predict(data_train_preproc, data_test)
+
+data_train_preproc
+```
+
+
+```{r}
+fitControl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  returnResamp = "all")
+
+model_rfpp <- train(botscore ~ ., data = train_df, 
+                  method = "ranger", trControl = fitControl)
+###predict the outcome on a test set
+model_rfpp_pred <- predict(model_rfpp, train_df)
+
+#metrics <- cbind(metrics, RFpp = postResample(pred = model_rfpp_pred, 
+#                                                obs = test_df$botscore) )
+mean(model_rfpp$resample$RMSE)
+```
+
+
+```{r}
+#fitControl <- trainControl(
+#  method = "oob",
+#  number = 5,
+#  returnResamp = "all")
+
+#model_rf_2 <- train(botscore ~ ., data = train_df, 
+#                  method = "ranger", trControl = fitControl)
+
+#mean(model_rf_2$resample$RMSE)
+```
+
+```{r}
+#fitControl <- trainControl(
+#  method = "repeatedcv",
+#  number = 7,
+#  repeats = 3,
+#  returnResamp = "all")
+
+#model_rf_1 <- train(botscore ~ ., data = data_train, 
+#                  method = "ranger", trControl = fitControl)
+# predict the outcome on a test set
+#model_rfpp_pred <- predict(model_rfpp, train_df)
+
+#metrics <- cbind(metrics, RFpp = postResample(pred = model_rfpp_pred, 
+#                                                obs = test_df$botscore) )
+#mean(model_rf_1$resample$RMSE)
+```
+
+#####################################################################
+
+
+```{r}
+# load the dataset
+testing_set <- read.csv("testing_set_features.csv.bz2", sep="\t", stringsAsFactors = F)
+```
+
+```{r}
+# construct the $\psi$ measure from the previous tutorial
+testing_set$psi <- testing_set$friendsCount / (testing_set$followersCount + 0.01)
+```
+
+Here we add our own features
+```{r}
+l <- as.numeric(as.Date(testing_set$collectionDate) - as.Date(testing_set$postedTime))
+testing_set$days_since_posted <- l
+
+testing_set$has_summary <- is.na(testing_set$summary)
+testing_set$has_summary <- testing_set$has_summary * 1
+
+testing_set$has_timezone <- is.na(testing_set$twitterTimeZone)
+testing_set$has_timezone <- testing_set$has_timezone * 1
+
+
+
+testing_set$words <- strsplit(sapply(gsub("[^[:alnum:][:space:]#]", "", testing_set$summary), tolower), " ")
+
+countHashOccurrences <- function(s) {
+    s2 <- gsub("#","",s)
+    return (nchar(s) - nchar(s2))
+}
+testing_set$no_hashtags <- countHashOccurrences(testing_set$summary)
+
+testing_set$median_wordlength <- as.numeric(lapply(lapply(testing_set$words, nchar), median))
+testing_set$median_wordlength[is.na(testing_set$median_wordlength)] <- 0
+
+testing_set$longest_word <- as.numeric(lapply(lapply(testing_set$words, nchar), (function (x) max(x, 0))))
+testing_set$longest_word[!is.finite(testing_set$median_wordlength)] <- 0
+```
+
+
+```{r}
+# Deal with missing value and category variables: 
+features = c(
+  'user_id', # WE NEED THIS
+  'listedCount', # drop na
+  'favoritesCount', # drop na
+  'friendsCount', # drop na
+  'followersCount', # drop na
+  'verified', # convert True to 1 and False to 0; na to 0 
+  'location.objectType', # convert "place" to 1, na to 0 
+  'mcsize', # convert na to 0
+  'influence', # drop na
+  'influence_percentile', # drop na
+  'tweetsCount', # drop na
+  'retweetsCount', # drop na
+  'days_since_posted',
+  'has_summary',
+  'has_timezone',
+  'no_hashtags', # maybe
+  'median_wordlength', # maybe
+  'longest_word', # maybe
+  'psi'
+)
+
+# keep only selected features
+testing_set <- testing_set[, features]
+
+# clean verified
+testing_set$verified[is.na(testing_set$verified)] <- F
+testing_set$verified <- testing_set$verified * 1
+
+# clean location.objectType
+testing_set$location.objectType[testing_set$location.objectType == "place"] <- 1
+testing_set$location.objectType[is.na(testing_set$location.objectType)] <- 0
+testing_set$location.objectType <- as.numeric(testing_set$location.objectType)
+
+# clean mcsize
+testing_set$mcsize[is.na(testing_set$mcsize)] <- 0
+
+
+
+
+# remove non-complete entries
+toKeep <- rowSums(is.na(testing_set)) == 0
+
+# keep track of removed rows and assign predictions to them
+deleted <- data.frame(testing_set[!toKeep,])
+###deleted <- rename(deleted, user_id = 1)
+deleted$botscore <- NA
+deleted$psi_percentile <- NA
+
+
+testing_set <- testing_set[toKeep, ]
+
+```
+
+```{r}
+myecdf <- ecdf(testing_set$psi)
+testing_set$psi_percentile <- myecdf(testing_set$psi)
+```
+
+```{r}
+test_df <- predict(data_train_preproc, testing_set[,c(  'listedCount', # drop na
+                                                        'favoritesCount', # drop na
+                                                        'friendsCount', # drop na
+                                                        'followersCount', # drop na
+                                                        'verified', # convert True to 1 and False to 0; na to 0 
+                                                        'location.objectType', # convert "place" to 1, na to 0 
+                                                        'mcsize', # convert na to 0
+                                                        'influence', # drop na
+                                                        'influence_percentile', # drop na
+                                                        'tweetsCount', # drop na
+                                                        'retweetsCount', # drop na
+                                                        'days_since_posted',
+                                                        'has_summary',
+                                                        'has_timezone',
+                                                        'no_hashtags', # maybe
+                                                        'median_wordlength', # maybe
+                                                        'longest_word', # maybe
+                                                        'psi')])
+```
+
+
+```{r}
+###testing_set$botscore <- predict(model_rf, testing_set)#, type="raw")
+testing_set$botscore <- predict(model_rfpp, test_df)
+
+result <- data.frame(testing_set)
+#result <- subset(result, select=c(user_id,is_bot))
+result <- rbind(result, deleted)
+
+result <- result[, c("user_id", "botscore")]
+#table(result$botness)
+```
+
+```{r}
+write.csv(result, file = "regressor_predictions_2.csv")
+```
+
+```{r}
+
+```
+

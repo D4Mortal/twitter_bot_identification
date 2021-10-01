@@ -1,0 +1,312 @@
+---
+title: COMP2550/COMP4450/COMP6445 - Data Science and Applied Machine Learning Lab Tutorial and More
+author: "Dr. Marian-Andrei Rizoiu"
+date: "13 March 2019"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r, warning=FALSE,message=FALSE,error=FALSE}
+# load in packages
+library(caret)
+library(dplyr)
+```
+
+### Loading the `#DebateNight` dataset
+
+We start with a series of operation already performed in quantitative measures tutorial.
+First, we load the 100,000 sample of the `#DebateNight` dataset:
+```{r}
+# load the dataset
+data_df <- read.csv("sample_users_100k.csv.bz2", sep="\t", stringsAsFactors = F)
+
+#data_df <- sample_n(tbl = data_df, size = 1000, replace = F)
+```
+Next, we coerce the `botscore` variable to be numeric and we correct abnormal values:
+```{r warning=FALSE,error=FALSE}
+# make botscore numerical and correct invalid data
+data_df$botscore <- as.numeric(data_df$botscore)
+toDel <- which(data_df$botscore < 0)
+data_df <- data_df[-toDel,]
+toDel <- which(is.na(data_df$botscore))
+data_df <- data_df[-toDel,]
+```
+
+Let's investigate the date posted
+```{r}
+###base_date <- as.Date(data_df[1, "collectionDate"])
+l <- as.numeric(as.Date(data_df$collectionDate) - as.Date(data_df$postedTime))
+data_df$days_since_posted <- l
+#data_df$days_since_posted[is.na(data_df$days_since_posted)] <- 0 #FIXME we may want to change this
+```
+
+```{r}
+# Human mean days since posted:
+mean(data_df$days_since_posted[data_df$botscore <= 0.5],na.rm = T)
+
+# Bot mean infrequent word usage:
+mean(data_df$days_since_posted[data_df$botscore > 0.5],na.rm = T)
+```
+
+So it seems that the mean days since posted is a little higher for humans than bots. Let's apply the t-test to check whether this could be statistically significant.
+
+We want to test the hypothesis "d.s.p. is higher for humans than for bots"
+
+```{r}
+t.test(data_df$days_since_posted[data_df$botscore <= 0.5],data_df$days_since_posted[data_df$botscore > 0.5],alternative = "greater")
+```
+
+We get a p-value of 2.2e-16, and so we can conclude that d.s.p. is significant to our problem. We shall set the NA values to the total average, in hopes that these entries are not affected by the value. FIXME Hold on! does NA mean that they've never posted? Then this value should be set to the max!
+
+```{r}
+#total_mean <- mean(data_df$days_since_posted,na.rm = T)
+#data_df[is.na(data_df$days_since_posted)] <- total_mean 
+```
+
+
+
+Let's compare the number of bots and humans who have "NA" summaries
+
+```{r}
+data_df$has_summary <- is.na(data_df$summary)
+data_df$has_summary <- data_df$has_summary * 1
+```
+
+```{r}
+mean(data_df$has_summary[data_df$botscore <= 0.5],na.rm = T)
+mean(data_df$has_summary[data_df$botscore > 0.5],na.rm = T)
+```
+
+This seems significant, so let's check the hypothesis "botness and the number of NA summaries is correlated"
+
+```{r}
+t.test(data_df$has_summary[data_df$botscore <= 0.5],data_df$has_summary[data_df$botscore > 0.5],alternative = "less")
+```
+
+Again, we get a low p-value, so we assume that there is a correlation between these two factors.
+
+Let's check utcOffset and twitterTimeZone na's
+
+```{r}
+data_df$has_offset <- is.na(data_df$utcOffset)
+data_df$has_offset <- data_df$has_offset * 1
+data_df$has_timezone <- is.na(data_df$twitterTimeZone)
+data_df$has_timezone <- data_df$has_timezone * 1
+```
+
+```{r}
+mean(data_df$has_offset[data_df$botscore <= 0.5],na.rm = T)
+mean(data_df$has_offset[data_df$botscore > 0.5],na.rm = T)
+```
+
+```{r}
+mean(data_df$has_timezone[data_df$botscore <= 0.5],na.rm = T)
+mean(data_df$has_timezone[data_df$botscore > 0.5],na.rm = T)
+```
+
+We notice that has_offset and has_timezone have very similar averages
+```{r}
+Reduce((function (x, y) x && y), data_df$has_offset == data_df$has_timezone)
+```
+
+That is because the values in these features are identical. So, we should discard one of these.
+
+
+Let's deconstruct the text for each message
+
+```{r}
+data_df$summary[is.na(data_df$summary)] <- ""
+data_df$words <- strsplit(sapply(gsub("[^[:alnum:][:space:]#]", "", data_df$summary), tolower), " ")
+```
+
+
+```{r}
+texts <- strsplit(sapply(gsub("[^[:alnum:][:space:]#]", "", data_df$summary), tolower), " ")
+words_df <- data.frame(frequency=integer())#,
+                       #diversity=integer())
+total_words <- 0
+total_texts <- length(texts)
+for (text in texts)
+{
+  total_words <- total_words + length(text)
+  i_have_not_yet_said <- TRUE
+  for (word in text)
+  {
+    if(word %in% rownames(words_df))
+    {
+      words_df[word, "frequency"] <- words_df[word, "frequency"] + 1
+#      if (i_have_not_yet_said)
+#      {
+#        words_df[word, "diversity"] <- words_df[word, "diversity"] + 1
+#        have_i_said <- FALSE
+#      }
+    }
+    else
+    {
+      words_df[word, "frequency"] <- 1
+      # FIXME probably need to <- rbind(words_df, new_word_df)
+#      words_df[word, "diversity"] <- 1
+#      have_i_said <- FALSE
+    }
+  }
+}
+
+print(words_df)
+```
+
+We sort the words by frequency
+
+```{r}
+w <- lapply(rownames(words_df), toString)
+words_df["word"] <- unlist(w)
+
+###words_df$word[is.na(words_df$word)] <- ""
+
+words_df[order(-words_df$frequency),]
+
+```
+
+We see that the words with frequency higher than 6000 are completely uninteresting, since they are just words that are common in the English language. At a frequency less that 6000 we still have common words such as "you" and "me," but let's for now assume that these words may be significant -- since these words can be used in a manipulative way as opposed to "a." This means we are interested in words that are approximately 0.7% or less of the total words. 
+
+```{r}
+words_df[order(words_df$frequency),]
+```
+
+If we sort the words in ascending order of frequency, we see a lot of words that are used only once by one person. This is not useful to us, as including these in our training algorithm would only introduce noise. (It could be worth analysing what sort of word it is, a url, a hashtag, or a football team, a simple mispelling, etc. BUT...) So what we will do is separate all words that were said only once, and check how many of these words are used by a person (maybe bots prefer to use words that are used a lot by others? maybe bots make up their own words?).
+
+We will consider words that occur fewer than 50 times as infrequent in this test
+
+```{r}
+#infrequent_words_df <- data.frame("frequency", "word")
+infrequent_words_df <- words_df[(words_df$frequency <= 50),]
+interesting_words_df <- words_df[(words_df$frequency > 50),]
+print(infrequent_words_df)
+print(interesting_words_df)
+
+```
+
+```{r}
+infrequents <- function(words){
+  count <- 0
+  for (wd in words) {
+    if (wd %in% unlist(infrequent_words_df$word)) {
+      count <- count + 1
+    }
+  }
+  return(count)
+}
+```
+
+Assign how many infrequent words each account used
+
+```{r}
+#data_df$infrequent_words_used <- infrequents(unlist(data_df$words))
+l <- lapply(data_df$words, infrequents)
+l_clean <- as.numeric(l)
+data_df$infrequent_words_used <- l_clean
+```
+
+
+Let's calculate the mean of infrequent words used for humans and bots
+```{r}
+# Human mean infrequent word usage:
+mean(data_df$infrequent_words_used[data_df$botscore <= 0.5],na.rm = T)
+
+# Bot mean infrequent word usage:
+mean(data_df$infrequent_words_used[data_df$botscore > 0.5],na.rm = T)
+```
+
+It doesn't seem significant, but let's perform a t-test just in case. We want to check the hypothesis "bots have a higher mean infrequent word usage"
+
+```{r}
+t.test(data_df$infrequent_words_used[data_df$botscore <= 0.5],data_df$infrequent_words_used[data_df$botscore > 0.5],alternative = "greater")
+```
+
+Indeed, we do not have a p-value low enough to support any correlation.
+
+Now let's examine the lengths of summaries
+```{r}
+data_df$summary_length <- as.numeric(lapply(data_df$words, length))
+```
+
+```{r}
+# Human mean summary lengths:
+mean(data_df$summary_length[data_df$botscore <= 0.5],na.rm = T)
+
+# Bot mean summary lengths:
+mean(data_df$summary_length[data_df$botscore > 0.5],na.rm = T)
+```
+
+It could be possible that bots tend to use longer summaries. Let's apply a t-test.
+```{r}
+t.test(data_df$summary_length[data_df$botscore <= 0.5],data_df$summary_length[data_df$botscore > 0.5],alternative = "greater")
+```
+
+This gives a p-value of 0.05686, which is just a bit higher than is typically acceptable to assume relation, but perhaps this is a useful feature for machine learning after all.
+
+
+We want to count the number of hashtags used by users.
+
+```{r}
+countHashOccurrences <- function(s) {
+    s2 <- gsub("#","",s)
+    return (nchar(s) - nchar(s2))
+}
+```
+
+```{r}
+data_df$no_hashtags <- countHashOccurrences(data_df$summary)
+```
+
+```{r}
+# Human mean number of hashtags:
+mean(data_df$no_hashtags[data_df$botscore <= 0.5],na.rm = T)
+
+# Bot mean number of hashtags:
+mean(data_df$no_hashtags[data_df$botscore > 0.5],na.rm = T)
+```
+
+It could be possible that bots tend to use more hashtags. Let's apply a t-test.
+```{r}
+t.test(data_df$no_hashtags[data_df$botscore <= 0.5],data_df$no_hashtags[data_df$botscore > 0.5],alternative = "less")
+```
+
+Let's consider the median word length
+```{r}
+data_df$median_wordlength <- as.numeric(lapply(lapply(data_df$words, nchar), median))
+data_df$median_wordlength[is.na(data_df$median_wordlength)] <- 0
+```
+
+```{r}
+# Human mean of median wordlength:
+mean(data_df$median_wordlength[data_df$botscore <= 0.5],na.rm = T)
+
+# Bot mean of median wordlength:
+mean(data_df$median_wordlength[data_df$botscore > 0.5],na.rm = T)
+```
+
+It seems that bots use shorter words than humans. Let's apply a t-test.
+```{r}
+t.test(data_df$median_wordlength[data_df$botscore <= 0.5],data_df$median_wordlength[data_df$botscore > 0.5],alternative = "greater")
+```
+
+Let's consider the longest word now.
+```{r}
+data_df$longest_word <- as.numeric(lapply(lapply(data_df$words, nchar), (function (x) max(x, 0))))
+data_df$longest_word[is.na(data_df$longest_word)] <- 0
+```
+
+```{r}
+# Human mean of longest word:
+mean(data_df$longest_word[data_df$botscore <= 0.5],na.rm = T)
+
+# Bot mean of longest word:
+mean(data_df$longest_word[data_df$botscore > 0.5],na.rm = T)
+```
+
+It seems bots use shorter longest words. Let's apply t-test.
+
+```{r}
+t.test(data_df$longest_word[data_df$botscore <= 0.5],data_df$longest_word[data_df$botscore > 0.5],alternative = "greater")
+```

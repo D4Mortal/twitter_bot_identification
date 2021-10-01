@@ -1,0 +1,806 @@
+
+The following code is built upon the sample code provided in the lab
+
+
+
+Load the library and data file
+
+```{r}
+library(caret)
+library(dplyr)
+library(ranger)
+library(ROSE)
+library(DMwR)
+library(mice)
+
+# Load the data set and testing set
+data_df <- read.csv("sample_users_100k.csv.bz2", sep="\t", stringsAsFactors = F, fileEncoding="UTF-8")
+testing_set <- read.csv("testing_set_features.csv.bz2", sep="\t", stringsAsFactors = F, fileEncoding="UTF-8")
+```
+
+
+
+```{r}
+classifier <- read.csv("predictions_u6055952_u6403808_u6575462.csv", sep="\t", stringsAsFactors = F, fileEncoding="UTF-8")
+regressor <- read.csv("regressor_predictions_2.csv", sep=",", stringsAsFactors = F, fileEncoding="UTF-8")
+regressor <- subset(regressor, select=c(user_id, botscore))
+
+merged <- merge(x = classifier, y = regressor, by.x = "user_id", by.y = "user_id")
+rowsKeep <- merged[100000:100314,]
+Keep <- is.na(merged$user_id)
+merged <- merged[!Keep, ]
+
+merged <- rbind(merged, rowsKeep)
+
+merged <- merged[, c("user_id", "botscore", "is_bot")]
+write.table(merged, file = "predictions_u6055952_u6403808_u6575462.csv",  sep = "\t", eol = "\n", row.names = FALSE,
+            col.names = TRUE)
+```
+
+
+
+Clean the data set for training
+
+```{r}
+# make botscore numerical and correct invalid data
+data_df$botscore <- as.numeric(data_df$botscore)
+toDel <- which(data_df$botscore < 0)
+data_df <- data_df[-toDel,]
+toDel <- which(is.na(data_df$botscore))
+data_df <- data_df[-toDel,]
+
+
+
+# construct the $\psi$ measure from the previous tutorial  
+data_df$psi <- data_df$friendsCount / (data_df$followersCount + 0.01)
+
+data_df$date <- as.numeric(as.Date(data_df[, "postedTime"]))
+  
+
+
+
+
+countHashOccurrences <- function(s) {
+    s2 <- gsub("#","",s)
+    return (nchar(s) - nchar(s2))
+}
+data_df$no_hashtags <- countHashOccurrences(data_df$summary)
+data_df$no_hashtags[is.na(data_df$no_hashtags)] <- 0
+data_df$words <- strsplit(sapply(gsub("[^[:alnum:][:space:]#]", "", data_df$summary), tolower), " ")
+data_df$median_wordlength <- as.numeric(lapply(lapply(data_df$words, nchar), median))
+data_df$median_wordlength[is.na(data_df$median_wordlength)] <- 0
+data_df$longest_word <- as.numeric(lapply(lapply(data_df$words, nchar), (function (x) max(x, 0))))
+data_df$longest_word[is.na(data_df$longest_word)] <- 0
+  
+
+
+
+
+# remove string data sets and convert numerical values to the appropriete data type
+features = c(
+  'utcOffset',  # convert na to 0
+  'statusesCount', # drop na
+  # 'summary',
+  'listedCount', # drop na
+  'favoritesCount', # drop na
+  'friendsCount', # drop na
+  'followersCount', # drop na
+  'verified', # convert True to 1 and False to 0; na to 0 
+  'location.objectType', # convert "place" to 1, na to 0 
+  'mcsize', # convert na to 0
+  'influence', # drop na
+  'influence_percentile', # drop na
+  'tweetsCount', # drop na
+  'retweetsCount', # drop na
+  'psi', 
+  'date', #drop na
+  'no_hashtags',
+  'median_wordlength',
+  'longest_word',
+  'botscore' # drop na
+)
+
+# keep only selected features
+data_df <- data_df[, features]
+
+# clean verified
+data_df$verified[is.na(data_df$verified)] <- F
+data_df$verified <- data_df$verified * 1
+
+# clean utc offset
+data_df$utcOffset<- ifelse(is.na(data_df$utcOffset), 0, 1)
+# data_df$summary<- ifelse(is.na(data_df$summary), 0, 1)
+
+
+
+
+
+
+# clean location.objectType
+data_df$location.objectType[data_df$location.objectType == "place"] <- 1
+data_df$location.objectType[is.na(data_df$location.objectType)] <- 0
+data_df$location.objectType <- as.numeric(data_df$location.objectType)
+
+# clean mcsize
+data_df$mcsize[is.na(data_df$mcsize)] <- 0
+
+
+
+
+
+#  Accuracy reduced with imputed data
+# # impute missing data for 
+# init = mice(data_df, maxit=0) 
+# meth = init$method
+# predM = init$predictorMatrix
+# 
+# predM[, c("botscore")]=0
+# meth[c("sum_betweenness")]="norm" 
+# meth[c("utcOffset","statusesCount","listedCount","favoritesCount","friendsCount","followersCount","verified","location.objectType",
+#        "mcsize","influence","influence_percentile","tweetsCount","retweetsCount","psi","date","botscore")]="" 
+# 
+# imputed = mice(data_df, method=meth, predictorMatrix=predM, m=40, maxit = 20)
+# imputed <- complete(imputed)
+# data_df <- imputed
+
+
+
+
+
+# remove non-complete entries
+toKeep <- rowSums(is.na(data_df)) == 0
+data_df <- data_df[toKeep, ]
+
+
+```
+
+
+
+
+Preparing the testing set for prediction, and keep track of the rows that removed due to incomplete entries, the predictions for removed rows will simply be NA
+```{r}
+
+
+
+
+# construct the $\psi$ measure from the previous tutorial  
+testing_set$psi <- testing_set$friendsCount / (testing_set$followersCount + 0.01)
+
+# convert the time posted into numerical values
+testing_set$date <- as.numeric(as.Date(testing_set[, "postedTime"]))
+  
+
+countHashOccurrences <- function(s) {
+    s2 <- gsub("#","",s)
+    return (nchar(s) - nchar(s2))
+}
+testing_set$no_hashtags <- countHashOccurrences(testing_set$summary)
+testing_set$no_hashtags[is.na(testing_set$no_hashtags)] <- 0
+testing_set$words <- strsplit(sapply(gsub("[^[:alnum:][:space:]#]", "", testing_set$summary), tolower), " ")
+testing_set$median_wordlength <- as.numeric(lapply(lapply(testing_set$words, nchar), median))
+testing_set$median_wordlength[is.na(testing_set$median_wordlength)] <- 0
+testing_set$longest_word <- as.numeric(lapply(lapply(testing_set$words, nchar), (function (x) max(x, 0))))
+testing_set$longest_word[is.na(testing_set$longest_word)] <- 0
+  
+# remove string data sets and convert numerical values to the appropriete data type
+features = c(
+  'user_id',
+  'utcOffset',
+  'statusesCount',
+  # 'summary',
+  'listedCount', # drop na
+  'favoritesCount', # drop na
+  'friendsCount', # drop na
+  'followersCount', # drop na
+  'verified', # convert True to 1 and False to 0; na to 0 
+  'location.objectType', # convert "place" to 1, na to 0 
+  'mcsize', # convert na to 0
+  'influence', # drop na
+  'influence_percentile', # drop na
+  'tweetsCount', # drop na
+  'retweetsCount', # drop na
+  'psi', 
+  'date',
+  'no_hashtags',
+  'median_wordlength',
+  'longest_word'
+)
+
+# keep only selected features
+testing_set <- testing_set[, features]
+
+# clean verified
+testing_set$verified[is.na(testing_set$verified)] <- F
+testing_set$verified <- testing_set$verified * 1
+
+
+testing_set$utcOffset<- ifelse(is.na(testing_set$utcOffset), 0, 1)
+# testing_set$summary<- ifelse(is.na(testing_set$summary), 0, 1)
+
+
+
+
+
+
+# clean location.objectType
+testing_set$location.objectType[testing_set$location.objectType == "place"] <- 1
+testing_set$location.objectType[is.na(testing_set$location.objectType)] <- 0
+testing_set$location.objectType <- as.numeric(testing_set$location.objectType)
+
+# clean mcsize
+testing_set$mcsize[is.na(testing_set$mcsize)] <- 0
+
+
+
+#  Imputed data not used
+# # impute missing data for 
+# init_testingset = mice(testing_set, maxit=0) 
+# meth_testingset = init_testingset$method
+# predM_testingset = init_testingset$predictorMatrix
+# 
+# predM_testingset[, c("user_id")]=0
+# meth_testingset[c("sum_betweenness")]="norm" 
+# meth_testingset[c("user_id","utcOffset","statusesCount","listedCount","favoritesCount","friendsCount","followersCount","verified","location.objectType",
+#        "mcsize","influence","influence_percentile","tweetsCount","retweetsCount","psi","date")]="" 
+# 
+# imputed_testingset = mice(testing_set, method=meth_testingset, predictorMatrix=predM_testingset, m=40, maxit = 20)
+# imputed_testingset <- complete(imputed_testingset)
+# testing_set <- imputed_testingset
+
+
+
+
+
+
+
+
+
+# remove non-complete entries
+toKeep <- rowSums(is.na(testing_set)) == 0
+
+# keep track of removed rows and assign predictions to them
+deleted <- data.frame(testing_set[!toKeep, "user_id"])
+deleted <- rename(deleted, user_id = 1)
+deleted$botness <- NA
+deleted$is_bot <- NA
+
+
+testing_set <- testing_set[toKeep, ]
+
+
+```
+
+
+
+
+
+Split the data into smaller training and testing sets for faster results
+```{r}
+# take a random seed and construct the traing data and test data
+# set.seed(252) 
+set.seed(195)
+sampleAll <- sample_n(tbl = data_df, size = 82454, replace = F)
+
+
+# binarize the botscore
+sampleAll$is_bot <- F
+sampleAll$is_bot[sampleAll$botscore > 0.5] <- T
+sampleAll$is_bot <- factor(sampleAll$is_bot)
+sampleAll$botscore <- NULL
+
+# splitting up the data for training and testing
+data_train_all <- sampleAll[1:80000,]
+data_train <- sampleAll[1:38000,]
+data_blend <- sampleAll[38001:76000,]
+data_test <- sampleAll[76001:82454,]
+
+
+
+# smote is synthesized values for oversampling
+# data_test_smote <- data.frame(data_test)
+# data_train_smote <- SMOTE(is_bot ~ ., data_train, perc.over = 200, perc.under=150)
+# data_blend_smote <- SMOTE(is_bot ~ ., data_blend, perc.over = 200, perc.under=150)
+
+#------------------------------------------------------------------------------------------------------------------------
+# under sample the training data
+
+# data with oversampling, undersampling, both and synthesized data with ROSE
+# data_train_balanced_over <- ovun.sample(is_bot ~ ., data = data_train, method = "over",N = 6000)$data
+data_train_balanced_under <- ovun.sample(is_bot ~ ., data = data_train, method = "under", N = 2600)$data   
+# data_train_balanced_both <- ovun.sample(is_bot ~ ., data = data_train, method = "both", p = 0.5)$data 
+# data_train_balanced_ROSE <- ROSE(is_bot ~ ., data = data_train, seed = 1)$data
+
+# table(data_train_balanced_over$is_bot)
+table(data_train_balanced_under$is_bot)
+# table(data_train_balanced_both$is_bot)
+# table(data_train_balanced_ROSE$is_bot)
+ 
+
+# data_blend_balanced_over <- ovun.sample(is_bot ~ ., data = data_blend, method = "over",N = 6000)$data
+data_blend_balanced_under <- ovun.sample(is_bot ~ ., data = data_blend, method = "under", N = 2500)$data
+# data_blend_balanced_both <- ovun.sample(is_bot ~ ., data = data_blend, method = "both", p = 0.5)$data 
+# data_blend_balanced_ROSE <- ROSE(is_bot ~ ., data = data_blend, seed = 1)$data
+table(data_blend_balanced_under$is_bot)
+
+
+data_train_balanced_under_all <- ovun.sample(is_bot ~ ., data = data_train_all, method = "under", N = 5600)$data  
+table(data_train_balanced_under_all$is_bot)
+
+# table(data_blend_balanced_over$is_bot)
+# table(data_blend_balanced_both$is_bot)
+# table(data_blend_balanced_ROSE$is_bot)
+
+# table(data_train_smote$is_bot)
+# table(data_blend_smote$is_bot)
+```
+
+Apply preprocessing to data (Not used)
+```{r}
+
+data_train_preproc <- preProcess(select(data_train, -is_bot), 
+                                 method = c("center", "scale", "YeoJohnson", "nzv", "pca"))
+data_train <- predict(data_train_preproc, data_train)
+data_test <- predict(data_train_preproc, data_test)
+```
+
+
+
+Construct the training structure
+
+```{r}
+# Construct the training 
+fitControl <- trainControl(
+  # Repeated 10–fold CV 
+  method = "cv",
+  number = 10,
+  # repeated 10 times
+
+  returnResamp = "all")
+
+fitControl_short <- trainControl(
+  # Repeated 10–fold CV 
+  method = "cv",
+  number = 10,
+  returnResamp = "all")
+
+fitControl_prob <- trainControl(
+  # Repeated 10–fold CV 
+  method = "repeatedcv",
+  number = 10,
+  # repeated 10 times
+  repeats = 3,
+  returnResamp = "all",
+  classProbs = TRUE)
+
+
+
+
+```
+
+
+
+Train with every algorithm we can use LOL
+
+```{r message=FALSE, warning=FALSE}
+model_rf <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "rf", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_ada <- train(is_bot ~ ., data = data_train_balanced_under,
+                       method = "adaboost", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_xgboost <- train(is_bot ~ ., data = data_train_balanced_under,
+                         method = "xgbDART", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_svm <- train(make.names(is_bot) ~ ., data = data_train_balanced_under,
+                        method = "svmRadial", preProcess = c("center", "scale"), trControl = fitControl_prob, tuneLength = 3)
+
+model_logistic <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "glm", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_bayes <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "naive_bayes", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_baggeddiscrim <- train(is_bot ~ ., data = data_train_balanced_under,
+                       method = "bagFDA", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_stocgrad <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "gbm", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_knn <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "knn", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_dnn <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "dnn", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_cardcost <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "rpartCost", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+# model_cforest <- train(is_bot ~ ., data = data_train_balanced_under,
+#                         method = "cforest", preProcess = c("center", "scale"), trControl = fitControl_short, tuneLength = 3)
+
+model_dwdRadial <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "dwdRadial", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_multiPercept <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "mlpWeightDecayML", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_evtree <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "evtree", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_nodeHarvest <- train(is_bot ~ ., data = data_train_balanced_under,
+                        method = "nodeHarvest", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_ranger <- train(make.names(is_bot) ~ ., data = data_train_balanced_under,
+                        method = "ranger", preProcess = c("center", "scale"), trControl = fitControl_prob, tuneLength = 3)
+
+# model_logisticEnsemble <- train(is_bot ~ ., data = data_train_balanced_under,
+#                         method = "randomGLM", preProcess = c("center", "scale"), trControl = fitControl_short, tuneLength = 3)
+```
+
+
+
+
+
+
+
+Train with synthesized oversampling datasets (not used)
+```{r}
+model_rf_smote <- train(is_bot ~ ., data = data_train_smote,
+                        method = "rf", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+
+model_ada_smote <- train(is_bot ~ ., data = data_train_smote,
+                        method = "adaboost", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_xgboost_smote <- train(is_bot ~ ., data = data_train_smote,
+                         method = "xgbDART", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_svm_smote <- train(make.names(is_bot) ~ ., data = data_train_smote,
+                        method = "svmRadial", preProcess = c("center", "scale"), trControl = fitControl_prob, tuneLength = 3)
+
+
+model_logistic_smote <- train(is_bot ~ ., data = data_train_smote,
+                        method = "glm", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+
+model_bayes_smote <- train(is_bot ~ ., data = data_train_smote,
+                        method = "naive_bayes", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+```
+
+
+
+
+
+Add the predicted value to the test set for stacked ensemble modelling
+```{r}
+
+data_test$pred_rf_prob<-unlist(predict(object = model_rf,data_test,type='prob')[1])
+data_test$pred_xgboost_prob<-unlist(predict(object = model_xgboost,data_test,type='prob')[1])
+data_test$pred_ada_prob<-unlist(predict(object = model_ada,data_test,type='prob')[1])
+data_test$pred_svm_prob<-unlist(predict(object = model_svm,data_test,type='prob')[1])
+data_test$pred_baggeddiscrim_prob<-unlist(predict(object = model_baggeddiscrim,data_test,type='prob')[1])
+data_test$pred_stocgrad_prob<-unlist(predict(object = model_stocgrad,data_test,type='prob')[1])
+data_test$pred_lr_prob<-unlist(predict(object = model_logistic,data_test,type='prob')[1])
+data_test$pred_bayes_prob<-unlist(predict(object = model_bayes,data_test,type='prob')[1])
+data_test$pred_knn_prob<-unlist(predict(object = model_knn,data_test,type='prob')[1])
+data_test$pred_dnn_prob<-unlist(predict(object = model_dnn,data_test,type='prob')[1])
+# data_test$pred_cforest_prob<-unlist(predict(object = model_cforest,data_test,type='prob')[1])
+data_test$pred_dwdradial_prob<-unlist(predict(object = model_dwdRadial,data_test,type='prob')[1])
+data_test$pred_multipercept_prob<-unlist(predict(object = model_multiPercept,data_test,type='prob')[1])
+data_test$pred_evtree_prob<-unlist(predict(object = model_evtree,data_test,type='prob')[1])
+data_test$pred_nodeHarvest_prob<-unlist(predict(object = model_nodeHarvest,data_test,type='prob')[1])
+data_test$pred_ranger_prob<-unlist(predict(object = model_ranger,data_test,type='prob')[1])
+# data_test$pred_logEnsem_prob<-unlist(predict(object = model_logisticEnsemble,data_test,type='prob')[1])
+
+
+```
+
+
+
+
+
+Add the predicted values to the blend set for training of the top level algorithm for stacked ensemble modelling
+```{r}
+
+
+data_blend_balanced_under$pred_rf_prob<- unlist(predict(model_rf,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_xgboost_prob<-unlist(predict(object = model_xgboost,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_ada_prob<-unlist(predict(model_ada,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_svm_prob<-unlist(predict(model_svm,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_baggeddiscrim_prob<-unlist(predict(model_baggeddiscrim,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_stocgrad_prob<-unlist(predict(model_stocgrad,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_lr_prob<- unlist(predict(model_logistic,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_bayes_prob<-unlist(predict(model_bayes,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_knn_prob<-unlist(predict(model_knn,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_dnn_prob<-unlist(predict(model_dnn,data_blend_balanced_under,type='prob')[1])
+# data_blend_balanced_under$pred_cforest_prob<-unlist(predict(model_cforest,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_dwdradial_prob<-unlist(predict(model_dwdRadial,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_multipercept_prob<-unlist(predict(model_multiPercept,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_evtree_prob<-unlist(predict(model_evtree,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_nodeHarvest_prob<-unlist(predict(model_nodeHarvest,data_blend_balanced_under,type='prob')[1])
+data_blend_balanced_under$pred_ranger_prob<-unlist(predict(model_ranger,data_blend_balanced_under,type='prob')[1])
+# data_blend_balanced_under$pred_logEnsem_prob<-unlist(predict(object = model_logisticEnsemble,data_blend_balanced_under,type='prob')[1])
+```
+
+
+
+Add the predicted value to the final testing set for stacked ensemble modelling
+```{r}
+
+testing_set$pred_rf_prob<-unlist(predict(object = model_rf,testing_set,type='prob')[1])
+testing_set$pred_xgboost_prob<-unlist(predict(object = model_xgboost,testing_set,type='prob')[1])
+testing_set$pred_ada_prob<-unlist(predict(object = model_ada,testing_set,type='prob')[1])
+testing_set$pred_svm_prob<-unlist(predict(object = model_svm,testing_set,type='prob')[1])
+testing_set$pred_baggeddiscrim_prob<-unlist(predict(object = model_baggeddiscrim,testing_set,type='prob')[1])
+testing_set$pred_stocgrad_prob<-unlist(predict(object = model_stocgrad,testing_set,type='prob')[1])
+testing_set$pred_lr_prob<-unlist(predict(object = model_logistic,testing_set,type='prob')[1])
+testing_set$pred_bayes_prob<-unlist(predict(object = model_bayes,testing_set,type='prob')[1])
+testing_set$pred_knn_prob<-unlist(predict(object = model_knn,testing_set,type='prob')[1])
+testing_set$pred_dnn_prob<-unlist(predict(object = model_dnn,testing_set,type='prob')[1])
+testing_set$pred_cforest_prob<-unlist(predict(object = model_cforest,testing_set,type='prob')[1])
+testing_set$pred_dwdradial_prob<-unlist(predict(object = model_dwdRadial,testing_set,type='prob')[1])
+testing_set$pred_multipercept_prob<-unlist(predict(object = model_multiPercept,testing_set,type='prob')[1])
+testing_set$pred_evtree_prob<-unlist(predict(object = model_evtree,testing_set,type='prob')[1])
+testing_set$pred_nodeHarvest_prob<-unlist(predict(object = model_nodeHarvest,testing_set,type='prob')[1])
+testing_set$pred_ranger_prob<-unlist(predict(object = model_ranger,testing_set,type='prob')[1])
+testing_set$pred_logEnsem_prob<-unlist(predict(object = model_logisticEnsemble,testing_set,type='prob')[1])
+```
+
+
+Create new set for blending and testing consisting of only predictions (Not used)
+```{r}
+# Make predictions for test set
+blend_pred <- data.frame(data_blend_balanced_under)
+test_pred <- data.frame(data_test)
+
+
+blend_pred <- subset(data_blend_balanced_under, select=c(pred_rf_prob, pred_xgboost_prob, pred_ada_prob,
+                                                         pred_svm_prob, pred_baggeddiscrim_prob, pred_stocgrad_prob, is_bot))
+
+test_pred <- subset(data_test, select=c(pred_rf_prob, pred_xgboost_prob, pred_ada_prob,
+                                        pred_svm_prob, pred_baggeddiscrim_prob, pred_stocgrad_prob, is_bot))
+
+```
+
+
+
+
+Averaging different models For simple bagging (Not used)
+```{r}
+
+data_test$pred_rf<- predict(model_rf, data_test)
+data_test$pred_ada<- predict(model_ada, data_test)
+data_test$pred_xgboost<- predict(model_xgboost, data_test)
+
+# Since its a boolean prediction, take average using probability instead
+data_test$pred_rf_prob<-predict(model_rf,data_test,type='prob')
+data_test$pred_ada_prob<-predict(model_ada,data_test,type='prob')
+data_test$pred_xgboost_prob<-predict(model_xgboost,data_test,type='prob')
+
+
+
+# taking the average
+data_test$pred_avg<-(data_test$pred_rf_prob$"FALSE"+data_test$pred_ada_prob$"FALSE"+data_test$pred_xgboost_prob$"FALSE")/3
+
+
+# conver the probability back to boolean values
+data_test$pred_avg<-as.factor(ifelse(data_test$pred_avg>0.5,"FALSE","TRUE"))
+
+
+
+
+# Use majority voting to decide the prediction
+data_test$pred_majority<-as.factor(ifelse(data_test$pred_rf=='FALSE' & data_test$pred_knn=='FALSE','FALSE',ifelse(data_test$pred_rf=='FALSE' & data_test$pred_lr=='FALSE','FALSE',ifelse(data_test$pred_knn=='FALSE' & data_test$pred_lr=='FALSE','FALSE','TRUE'))))
+
+
+# Use weighted average instead of balanced averagea
+data_test$pred_weighted_avg<-(data_test$pred_rf_prob$"FALSE"*0.25)+(data_test$pred_knn_prob$"FALSE"*0.25)+(data_test$pred_lr_prob$"FALSE"*0.5)
+
+#Splitting into binary classes at 0.5
+data_test$pred_weighted_avg<-as.factor(ifelse(data_test$pred_weighted_avg>0.5,'FALSE','TRUE'))
+
+
+```
+
+
+
+
+train top layer model
+```{r}
+top_level_model_rf <- train(is_bot ~ ., data = data_blend_balanced_under,
+                        method = "rf", preProcess = c("center", "scale"), trControl = fitControl)
+
+# top_level_model_pred <- train(is_bot ~ ., data = blend_pred,
+#                         method = "nnet", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+```
+
+bagFDA rf
+
+
+removing certain prediction models(Not used)
+
+```{r}
+data_blend_balanced_under <- subset(data_blend_balanced_under, select=-c(pred_svm_prob,pred_baggeddiscrim_prob,pred_stocgrad_prob ))
+data_test <- subset(data_test, select=-c(pred_svm_prob,pred_baggeddiscrim_prob,pred_stocgrad_prob))
+
+```
+
+
+```{r}
+model_rf <- train(is_bot ~ ., data = data_train_balanced_under_all,
+                        method = "rf", preProcess = c("center", "scale"), trControl = fitControl, tuneLength = 3)
+```
+
+
+Test and Build confusion matrix for more accurate information
+```{r}
+
+model_logistic_pred <- predict(top_level_model_rf, data_test, type="raw")
+
+postResample(pred = model_logistic_pred, obs = data_test$is_bot)
+
+
+confusionMatrix(data = model_logistic_pred, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+
+
+
+```
+ 
+ 
+ 
+ 
+ 
+```{r}
+predictionPlot <- predict(top_level_model_rf, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+
+RF <- c(tempMatrix$byClass[11])
+data <- data.frame(RF)
+barplot(height = 1, names.arg = names(data),
+          main = rownames(data), col = cm.colors(4)[1:4]) 
+
+
+predictionPlot <- predict(model_ada, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Ada = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_xgboost, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, XG = tempMatrix$byClass[11])
+
+predictionPlot <- predict(model_dnn, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, DNN = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_stocgrad, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Stc = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_multiPercept, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Per = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_knn, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, KNN = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_bayes, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Bay = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_logisticEnsemble, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Enl = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_evtree, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Evt = tempMatrix$byClass[11])
+
+
+predictionPlot <- predict(model_baggeddiscrim, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, Disc = tempMatrix$byClass[11])
+
+
+
+predictionPlot <- predict(top_level_model_rf, data_test, type="raw")
+tempMatrix <- confusionMatrix(data = predictionPlot, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything")
+data <- cbind(data, top = tempMatrix$byClass[11])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+barplot(height = unlist(data), names.arg = names(data),
+          main = rownames(data), col = cm.colors(10)[1:10])  
+
+```
+ 
+ 
+
+Make prediction to the final testing set and build the data frame for the results
+```{r}
+testing_set$is_bot <- predict(top_level_model_rf, testing_set, type="raw")
+result <- data.frame(testing_set)
+
+result$botness <- 0.5
+result[5:7, "botness"] <- 0.8
+result <- subset(result, select=c(user_id, botness, is_bot))
+result <- rbind(result, deleted)
+table(result$is_bot)
+
+result <- rename(result, botscore = 2)
+result <- subset(result, select=c(user_id, is_bot))
+
+grading_file <- data.frame(result)
+
+
+# result <- subset(result, select=c(user_id,is_bot))
+
+write.table(result, file = "predictions_u6055952_u6403808_u6575462.csv",  sep = "\t", eol = "\n", row.names = FALSE,
+            col.names = TRUE)
+
+# grading_file <-  rename(grading_file, botscore_gt = 2)
+# grading_file <-  rename(grading_file, is_bot_gt = 3)
+write.table(grading_file, file = "grading_file.csv",  sep = "\t", eol = "\n", row.names = FALSE,
+            col.names = TRUE)
+```
+
+```{r}
+plot(confusionMatrix(data = model_logistic_pred, reference = data_test$is_bot, 
+                dnn = c("Predicted", "Observed"), positive = "TRUE", mode = "everything"))
+```
+ 
+ 
+             
+
+```{r}
+plot(top_level_model_rf, data = data_test$is_bot)
+```
+ 
+ 
+ 
+Compute precision
+```{r}
+measures <- c(precision = precision(data = model_logistic_pred, 
+                                    reference = data_test$is_bot,
+                                    relevant = "TRUE"),
+              recall = recall(data = model_logistic_pred, 
+                              reference = data_test$is_bot, 
+                              relevant = "TRUE"),
+              fmeasure = F_meas(data = model_logistic_pred, 
+                                reference = data_test$is_bot, 
+                                relevant = "TRUE") )
+print(measures, digits = 2)
+```
+
